@@ -25,8 +25,15 @@ function activeChord(song: SongArrangement, beat: number) {
   return [...song.chords].reverse().find((chord) => chord.beat <= beat) || song.chords[0];
 }
 
-function makeSteps(song: SongArrangement, level: number, shift: number): PracticeStep[] {
-  const move = (notes: number[]) => notes.map((note) => note + shift);
+function foldNote(note: number, target: [number, number]) {
+  let value = note;
+  while (value < target[0]) value += 12;
+  while (value > target[1]) value -= 12;
+  return value;
+}
+
+function makeSteps(song: SongArrangement, level: number, shift: number, target: [number, number]): PracticeStep[] {
+  const move = (notes: number[]) => [...new Set(notes.map((note) => foldNote(note + shift, target)))].sort((a, b) => a - b);
   if (level === 1) {
     return song.chords.slice(0, 8).map((chord) => ({
       label: chord.symbol,
@@ -48,9 +55,9 @@ function makeSteps(song: SongArrangement, level: number, shift: number): Practic
   if (level === 3) {
     return song.chords.slice(0, 8).flatMap((chord) => {
       const notes = move(chord.notes);
-      const root = notes[0] > 59 ? notes[0] - 12 : notes[0];
-      const fifth = root + 7;
-      const upper = notes.map((note) => note < 60 ? note + 12 : note);
+      const root = foldNote(notes[0] > 59 ? notes[0] - 12 : notes[0], target);
+      const fifth = foldNote(root + 7, target);
+      const upper = notes.map((note) => foldNote(note < 60 ? note + 12 : note, target));
       return [
         { label: chord.symbol, sublabel: "左手 · 根音", notes: [root], duration: 1, lyric: chord.lyric },
         { label: chord.symbol, sublabel: "右手 · 和弦", notes: upper, duration: 1, lyric: chord.lyric },
@@ -110,7 +117,7 @@ export default function Home() {
 
   const rangeFit = useMemo(() => fitRange(song.range, mode), [song.range, mode]);
   const shift = rangeFit.shift;
-  const steps = useMemo(() => makeSteps(song, level, shift), [song, level, shift]);
+  const steps = useMemo(() => makeSteps(song, level, shift, rangeFit.target), [song, level, shift, rangeFit.target]);
   const currentStep = steps[Math.min(stepIndex, Math.max(steps.length - 1, 0))];
   const nextStep = steps[Math.min(stepIndex + 1, Math.max(steps.length - 1, 0))];
   const keyboardStart = mode === 36 ? 48 : 36;
@@ -119,6 +126,32 @@ export default function Home() {
     [mode, keyboardStart],
   );
   const progress = steps.length ? Math.round((stepIndex / steps.length) * 100) : 0;
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/song.musicxml")
+      .then((response) => {
+        if (!response.ok) throw new Error(`MusicXML HTTP ${response.status}`);
+        return response.text();
+      })
+      .then((xml) => {
+        if (cancelled) return;
+        const parsed = parseMusicXml(xml);
+        setSong({
+          ...parsed,
+          title: "像风一样",
+          artist: "薛之谦 · MusicXML 双声部编配",
+          sourceLabel: "内置正式 MusicXML · 已生成四关",
+        });
+        setLevel(1);
+        setStepIndex(0);
+        setFeedback("先听完整示范，记住旋律与和声走向");
+      })
+      .catch((error) => {
+        if (!cancelled) setImportMessage(error instanceof Error ? error.message : "默认曲谱加载失败");
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     midiRef.current?.setMode(mode);
@@ -234,27 +267,35 @@ export default function Home() {
     setStepIndex(0);
 
     const demoSteps = level === 1 ? steps : steps.slice(0, 16);
-    demoSteps.forEach((step, index) => {
-      const lightTimer = window.setTimeout(() => midiRef.current?.restore(step.notes, demoSteps[index + 1]?.notes || []), cursor * 1000);
-      const screenTimer = window.setTimeout(() => setStepIndex(index), cursor * 1000 + 200);
-      timersRef.current.push(lightTimer, screenTimer);
-      step.notes.forEach((note) => {
-        const source = `demo-${index}`;
-        piano.noteOn(note, level === 1 ? 72 : 88, source, startAt + cursor);
-        const offTimer = window.setTimeout(
-          () => piano.noteOff(note, source),
-          (cursor + Math.min(step.duration * secondsPerBeat, 1.8)) * 1000 + 280,
-        );
-        timersRef.current.push(offTimer);
-      });
-      cursor += Math.max(0.45, step.duration * secondsPerBeat);
-    });
     if (level === 1) {
-      song.melody.slice(0, 64).forEach((event, index) => {
+      const chordEvents = song.chords.slice(0, demoSteps.length);
+      const finalBeat = chordEvents.at(-1)
+        ? chordEvents.at(-1)!.beat + chordEvents.at(-1)!.duration
+        : 32;
+      chordEvents.forEach((chord, index) => {
+        const step = demoSteps[index];
+        const eventStart = chord.beat * secondsPerBeat;
+        const lightTimer = window.setTimeout(
+          () => midiRef.current?.restore(step.notes, demoSteps[index + 1]?.notes || []),
+          eventStart * 1000,
+        );
+        const screenTimer = window.setTimeout(() => setStepIndex(index), eventStart * 1000 + 200);
+        timersRef.current.push(lightTimer, screenTimer);
+        step.notes.forEach((note) => {
+          const source = `demo-${index}`;
+          piano.noteOn(note, 72, source, startAt + eventStart);
+          const offTimer = window.setTimeout(
+            () => piano.noteOff(note, source),
+            (eventStart + Math.min(chord.duration * secondsPerBeat, 1.8)) * 1000 + 280,
+          );
+          timersRef.current.push(offTimer);
+        });
+      });
+      song.melody.filter((event) => event.beat < finalBeat).forEach((event, index) => {
         const source = `melody-${index}`;
         const eventStart = event.beat * secondsPerBeat;
         event.notes.forEach((rawNote) => {
-          const note = rawNote + shift;
+          const note = foldNote(rawNote + shift, rangeFit.target);
           piano.noteOn(note, 94, source, startAt + eventStart);
           const offTimer = window.setTimeout(
             () => piano.noteOff(note, source),
@@ -262,6 +303,23 @@ export default function Home() {
           );
           timersRef.current.push(offTimer);
         });
+      });
+      cursor = finalBeat * secondsPerBeat;
+    } else {
+      demoSteps.forEach((step, index) => {
+        const lightTimer = window.setTimeout(() => midiRef.current?.restore(step.notes, demoSteps[index + 1]?.notes || []), cursor * 1000);
+        const screenTimer = window.setTimeout(() => setStepIndex(index), cursor * 1000 + 200);
+        timersRef.current.push(lightTimer, screenTimer);
+        step.notes.forEach((note) => {
+          const source = `demo-${index}`;
+          piano.noteOn(note, 88, source, startAt + cursor);
+          const offTimer = window.setTimeout(
+            () => piano.noteOff(note, source),
+            (cursor + Math.min(step.duration * secondsPerBeat, 1.8)) * 1000 + 280,
+          );
+          timersRef.current.push(offTimer);
+        });
+        cursor += Math.max(0.45, step.duration * secondsPerBeat);
       });
     }
     const endTimer = window.setTimeout(() => {
@@ -425,7 +483,7 @@ export default function Home() {
               {["C", "Am", "F", "G"].map((symbol) => {
                 const chord = song.chords.find((item) => item.symbol.replace(/♯|♭/g, "") === symbol)?.notes
                   || DEMO_SONG.chords.find((item) => item.symbol === symbol)!.notes;
-                return <button key={symbol} onClick={() => pressChord(chord.map((note) => note + shift))}>{symbol}</button>;
+                return <button key={symbol} onClick={() => pressChord(chord.map((note) => foldNote(note + shift, rangeFit.target)))}>{symbol}</button>;
               })}
             </div>
           )}
@@ -445,7 +503,7 @@ export default function Home() {
             <div><small>音域</small><strong>{midiName(song.range[0])}–{midiName(song.range[1])}</strong></div>
             <div><small>和弦</small><strong>{song.chords.length}</strong></div>
             <div><small>歌词</small><strong>{song.lyrics.length ? "已包含" : "待导入"}</strong></div>
-            <div><small>移调</small><strong>{shift ? `${shift > 0 ? "+" : ""}${shift}` : "原位"}</strong></div>
+            <div><small>音域适配</small><strong>{!rangeFit.fits ? "八度折叠" : shift ? `${shift > 0 ? "+" : ""}${shift}` : "原位"}</strong></div>
           </div>
           {song.warnings.length > 0 && <p className="panel-warning">{song.warnings[0]}</p>}
           <img src="/partykeys-keyboard.png" alt="音乐密码 36 键键盘" />

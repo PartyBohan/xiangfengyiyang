@@ -147,6 +147,94 @@ function parseHarmony(harmony: Element, beat: number) {
   return { beat, symbol, notes: chordNotes(symbol, rootMidi) };
 }
 
+function partPitchStats(part: Element) {
+  const notes = Array.from(part.querySelectorAll("note"))
+    .map(midiFromPitch)
+    .filter((note): note is number => note != null);
+  return {
+    part,
+    notes,
+    average: notes.length ? notes.reduce((sum, note) => sum + note, 0) / notes.length : -Infinity,
+  };
+}
+
+function rootName(pitchClass: number, preferFlats: boolean) {
+  const sharp = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"];
+  const flat = ["C", "D♭", "D", "E♭", "E", "F", "G♭", "G", "A♭", "A", "B♭", "B"];
+  return (preferFlats ? flat : sharp)[((pitchClass % 12) + 12) % 12];
+}
+
+function diatonicQuality(rootClass: number, fifths: number) {
+  const tonic = ((fifths * 7) % 12 + 12) % 12;
+  const degree = ((rootClass - tonic) % 12 + 12) % 12;
+  const degrees = [0, 2, 4, 5, 7, 9, 11];
+  const qualities = ["", "m", "m", "", "", "m", "dim"];
+  const index = degrees.indexOf(degree);
+  return index >= 0 ? qualities[index] : "";
+}
+
+function deriveChordsFromAccompaniment(
+  part: Element | undefined,
+  beatsPerBar: number,
+  fifths: number,
+) {
+  if (!part) return [] as ChordEvent[];
+  let divisions = 1;
+  let absoluteBeat = 0;
+  const result: ChordEvent[] = [];
+
+  for (const measure of Array.from(part.querySelectorAll(":scope > measure"))) {
+    const nextDivisions = Number(directText(measure, "attributes > divisions"));
+    if (nextDivisions > 0) divisions = nextDivisions;
+    let cursor = 0;
+    let previousStart = 0;
+    const events: Array<{ start: number; note: number }> = [];
+
+    for (const child of Array.from(measure.children)) {
+      if (child.tagName === "backup") {
+        cursor -= Number(directText(child, "duration") || 0) / divisions;
+        continue;
+      }
+      if (child.tagName === "forward") {
+        cursor += Number(directText(child, "duration") || 0) / divisions;
+        continue;
+      }
+      if (child.tagName !== "note") continue;
+      const duration = Math.max(Number(directText(child, ":scope > duration") || divisions) / divisions, 0.125);
+      const isChordTone = Boolean(child.querySelector(":scope > chord"));
+      const start = isChordTone ? previousStart : cursor;
+      const midi = midiFromPitch(child);
+      if (midi != null) events.push({ start, note: midi });
+      previousStart = start;
+      if (!isChordTone) cursor += duration;
+    }
+
+    const segmentLength = beatsPerBar >= 4 ? beatsPerBar / 2 : beatsPerBar;
+    const measureChords: ChordEvent[] = [];
+    for (let start = 0; start < beatsPerBar; start += segmentLength) {
+      const segmentNotes = events
+        .filter((event) => event.start >= start && event.start < start + segmentLength)
+        .map((event) => event.note);
+      if (!segmentNotes.length) continue;
+      const rootClass = Math.min(...segmentNotes) % 12;
+      const quality = diatonicQuality(rootClass, fifths);
+      const symbol = `${rootName(rootClass, fifths < 0)}${quality}`;
+      const rootMidi = 48 + rootClass;
+      const intervals = quality === "m" ? [0, 3, 7] : quality === "dim" ? [0, 3, 6] : [0, 4, 7];
+      const notes = intervals.map((interval) => rootMidi + interval);
+      const previous = measureChords.at(-1);
+      if (previous?.symbol === symbol) {
+        previous.duration += segmentLength;
+      } else {
+        measureChords.push({ beat: absoluteBeat + start, duration: segmentLength, symbol, notes });
+      }
+    }
+    result.push(...measureChords);
+    absoluteBeat += Math.max(cursor, beatsPerBar);
+  }
+  return result;
+}
+
 export function parseMusicXml(xmlText: string): SongArrangement {
   const xml = new DOMParser().parseFromString(xmlText, "application/xml");
   const parserError = xml.querySelector("parsererror");
@@ -172,9 +260,9 @@ export function parseMusicXml(xmlText: string): SongArrangement {
   const fifths = Number(directText(xml.documentElement, "key > fifths") || 0);
 
   const partCandidates = Array.from(xml.querySelectorAll("part"));
-  const part = partCandidates.sort((a, b) =>
-    b.querySelectorAll("note pitch").length - a.querySelectorAll("note pitch").length,
-  )[0];
+  const partStats = partCandidates.map(partPitchStats).filter((stats) => stats.notes.length);
+  const part = [...partStats].sort((a, b) => b.average - a.average)[0]?.part;
+  const accompanimentPart = [...partStats].sort((a, b) => a.average - b.average)[0]?.part;
   if (!part) throw new Error("MusicXML 中没有可读取的声部。");
 
   let divisions = 1;
@@ -182,7 +270,6 @@ export function parseMusicXml(xmlText: string): SongArrangement {
   const melody: MelodyEvent[] = [];
   const harmonies: Array<{ beat: number; symbol: string; notes: number[] }> = [];
   const lyrics: string[] = [];
-  const allNotes: number[] = [];
 
   for (const measure of Array.from(part.querySelectorAll(":scope > measure"))) {
     const nextDivisions = Number(directText(measure, "attributes > divisions"));
@@ -213,7 +300,6 @@ export function parseMusicXml(xmlText: string): SongArrangement {
 
       if (lyric) lyrics.push(lyric);
       if (midi != null) {
-        allNotes.push(midi);
         const existing = melody.find((event) => Math.abs(event.beat - (absoluteBeat + start)) < 0.0001);
         if (existing && isChordTone) {
           existing.notes.push(midi);
@@ -236,12 +322,17 @@ export function parseMusicXml(xmlText: string): SongArrangement {
       duration: Math.max((harmonies[index + 1]?.beat ?? absoluteBeat) - harmony.beat, 1),
     }));
   } else {
-    warnings.push("文件中没有和弦标记，暂用 C–Am–F–G 作为伴奏骨架，可在后续编辑中修正。");
-    const bars = Math.max(4, Math.ceil(absoluteBeat / beatsPerBar));
-    chords = Array.from({ length: bars }, (_, index) => {
-      const symbol = ["C", "Am", "F", "G"][index % 4];
-      return { beat: index * beatsPerBar, duration: beatsPerBar, symbol, notes: CHORD_TONES[symbol] };
-    });
+    chords = deriveChordsFromAccompaniment(accompanimentPart, beatsPerBar, fifths);
+    if (chords.length) {
+      warnings.push("文件没有和弦文字标记，已从低音伴奏声部自动识别和弦。");
+    } else {
+      warnings.push("文件中没有可识别的和弦，暂用 C–Am–F–G 作为伴奏骨架。");
+      const bars = Math.max(4, Math.ceil(absoluteBeat / beatsPerBar));
+      chords = Array.from({ length: bars }, (_, index) => {
+        const symbol = ["C", "Am", "F", "G"][index % 4];
+        return { beat: index * beatsPerBar, duration: beatsPerBar, symbol, notes: CHORD_TONES[symbol] };
+      });
+    }
   }
 
   if (!lyrics.length) warnings.push("文件中没有歌词，将以小节编号显示；可重新上传带歌词的 MusicXML。");
@@ -256,7 +347,10 @@ export function parseMusicXml(xmlText: string): SongArrangement {
     beatUnit: beatUnit || 4,
     source: "musicxml",
     sourceLabel: "已由 MusicXML 生成四关",
-    range: [Math.min(...allNotes), Math.max(...allNotes)],
+    range: [
+      Math.min(...partStats.flatMap((stats) => stats.notes)),
+      Math.max(...partStats.flatMap((stats) => stats.notes)),
+    ],
     chords,
     melody,
     lyrics,
