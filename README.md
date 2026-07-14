@@ -23,7 +23,8 @@
 - 支持 Web MIDI / MidiBrowser 输入，也支持屏幕虚拟键盘。
 - 普通 MIDI 键盘可发声与判定；只有识别为 PartyKeys 的输出才发送专用 SysEx。
 - PartyKeys 36 使用 CMD `0x15` RGB、连接后 `0F 01` 初始化、差异更新、停止时全灭；单帧不超过 256 bytes。
-- 内置 Salamander Grand Piano V3 的 13 音高 × 4 力度采样，加载前使用合成音色兜底。署名见 [AUDIO_CREDITS.md](AUDIO_CREDITS.md)。
+- 音频链路与 `foundation.partykeys.ai` 对齐：Salamander Grand Piano V3 的 13 音高 × 4 力度采样、48 声部上限、`-14 dB` 压缩器、1.9 秒立体声空间混响和周期波降级音色。
+- 52 个 MP3 已与 PartyKeysDevFoundation 当前仓库逐文件核对一致；加载前或解码失败时继续使用合成音色兜底。署名见 [AUDIO_CREDITS.md](AUDIO_CREDITS.md)。
 
 ## 36 / 72 键模式
 
@@ -39,7 +40,9 @@ pnpm dev
 pnpm build
 ```
 
-本项目部署在 Vercel。MIDI、BLE 和灯光功能必须继续通过真实 PartyKeys 设备验收，浏览器构建通过不等同于硬件发布就绪。
+本项目部署在 Vercel，固定 Node.js 22，并使用与 Foundation 环境一致的安全响应头以及音色/产品资产长期缓存。MIDI、BLE 和灯光功能必须继续通过真实 PartyKeys 设备验收，浏览器构建通过不等同于硬件发布就绪。
+
+当前灯光配置继续面向支持 CMD `0x15` 的 PartyKeys 36 RGB 固件；尚未在目标实体琴批次验证，不将其描述为所有旧固件的通用兼容结论。
 
 ## License
 

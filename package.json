@@ -3,13 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "packageManager": "pnpm@11.7.0",
-  "engines": { "node": ">=22.13.0" },
+  "engines": { "node": "22.x" },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "test": "next build",
-    "lint": "eslint . --ignore-pattern .next"
+    "test": "node --experimental-strip-types --test tests/*.test.mjs && next build",
+    "lint": "eslint app lib"
   },
   "dependencies": {
     "next": "16.2.6",

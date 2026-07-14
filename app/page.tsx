@@ -1,8 +1,9 @@
 "use client";
 
 import { ChangeEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import Image from "next/image";
 import { DEMO_SONG, SongArrangement, fitRange, midiName, parseMusicXml } from "../lib/music";
-import { FourLayerPiano, NormalizedMidiEvent, PartyKeysMidi } from "../lib/partykeys";
+import { FourLayerPiano, isMidiBrowserEnvironment, NormalizedMidiEvent, PartyKeysMidi } from "../lib/partykeys";
 
 type PracticeStep = {
   label: string;
@@ -106,14 +107,11 @@ export default function Home() {
   const [midiStatus, setMidiStatus] = useState({ inputs: 0, partyKeys: 0, outputs: 0 });
   const [midiError, setMidiError] = useState("");
   const [showRangeNotice, setShowRangeNotice] = useState(false);
-  const pianoRef = useRef<FourLayerPiano | null>(null);
-  const midiRef = useRef<PartyKeysMidi | null>(null);
+  const [piano] = useState(() => new FourLayerPiano());
+  const [midi] = useState(() => new PartyKeysMidi());
   const playedRef = useRef<Set<number>>(new Set());
   const timersRef = useRef<number[]>([]);
   const midiHandlerRef = useRef<(event: NormalizedMidiEvent) => void>(() => {});
-
-  if (!pianoRef.current && typeof window !== "undefined") pianoRef.current = new FourLayerPiano();
-  if (!midiRef.current && typeof window !== "undefined") midiRef.current = new PartyKeysMidi();
 
   const rangeFit = useMemo(() => fitRange(song.range, mode), [song.range, mode]);
   const shift = rangeFit.shift;
@@ -145,6 +143,7 @@ export default function Home() {
         });
         setLevel(1);
         setStepIndex(0);
+        setShowRangeNotice(parsed.range[0] < 48 || parsed.range[1] > 83);
         setFeedback("先听完整示范，记住旋律与和声走向");
       })
       .catch((error) => {
@@ -154,28 +153,20 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    midiRef.current?.setMode(mode);
-    setStepIndex(0);
-    setHeld(new Set());
-    playedRef.current.clear();
-    setShowRangeNotice(song.range[0] < rangeFit.target[0] || song.range[1] > rangeFit.target[1]);
-  }, [mode, song.range, rangeFit.target]);
-
-  useEffect(() => {
     if (!currentStep) return;
-    midiRef.current?.restore(currentStep.notes, nextStep?.notes || []);
-  }, [currentStep, nextStep]);
+    midi.restore(currentStep.notes, nextStep?.notes || []);
+  }, [currentStep, nextStep, midi]);
 
   useEffect(() => () => {
     timersRef.current.forEach((timer) => window.clearTimeout(timer));
-    pianoRef.current?.releaseAll();
-    midiRef.current?.allOff();
-  }, []);
+    piano.releaseAll();
+    midi.allOff();
+  }, [midi, piano]);
 
   function stopPlayback() {
     timersRef.current.forEach((timer) => window.clearTimeout(timer));
     timersRef.current = [];
-    pianoRef.current?.releaseAll();
+    piano.releaseAll();
     setPlaying(false);
   }
 
@@ -192,7 +183,7 @@ export default function Home() {
     const nextIndex = stepIndex + 1;
     if (nextIndex >= steps.length) {
       setStepIndex(steps.length);
-      midiRef.current?.allOff();
+      midi.allOff();
       setFeedback(`第 ${level} 关完成！`);
       return;
     }
@@ -209,45 +200,51 @@ export default function Home() {
 
   function handleMidi(event: NormalizedMidiEvent) {
     if (event.type === "on" && event.note != null) {
-      pianoRef.current?.noteOn(event.note, event.velocity || 96, "user");
+      piano.noteOn(event.note, event.velocity || 96, "user");
       registerNote(event.note);
     }
     if (event.type === "off" && event.note != null) {
-      pianoRef.current?.noteOff(event.note, "user");
+      piano.noteOff(event.note, "user");
       releaseNote(event.note);
     }
-    if (event.type === "pedal") pianoRef.current?.setPedal(Boolean(event.on));
+    if (event.type === "pedal") piano.setPedal(Boolean(event.on));
   }
 
-  midiHandlerRef.current = handleMidi;
+  useEffect(() => {
+    midiHandlerRef.current = handleMidi;
+  });
 
   async function connectMidi() {
     setMidiError("");
-    pianoRef.current?.ensureAudio();
+    piano.ensureAudio();
     try {
-      await midiRef.current?.connect((event) => midiHandlerRef.current(event), setMidiStatus);
-      if (midiStatus.inputs === 0) setFeedback("MIDI 已就绪，等待设备连接");
+      const status = await midi.connect((event) => midiHandlerRef.current(event), setMidiStatus);
+      if (!status?.inputs) {
+        setFeedback(isMidiBrowserEnvironment()
+          ? "MIDI 已就绪，请点击 MIDI Browser 底部“连接 MIDI 设备”完成配对"
+          : "MIDI 已就绪，等待设备连接");
+      }
     } catch (error) {
       setMidiError(error instanceof Error ? error.message : "MIDI 连接失败");
     }
   }
 
   function pressVirtual(note: number) {
-    pianoRef.current?.ensureAudio();
-    pianoRef.current?.noteOn(note, 96, "screen");
+    piano.ensureAudio();
+    piano.noteOn(note, 96, "screen");
     registerNote(note);
   }
 
   function releaseVirtual(note: number) {
-    pianoRef.current?.noteOff(note, "screen");
+    piano.noteOff(note, "screen");
     releaseNote(note);
   }
 
   function pressChord(notes: number[]) {
-    pianoRef.current?.ensureAudio();
-    notes.forEach((note) => pianoRef.current?.noteOn(note, 90, "screen"));
+    piano.ensureAudio();
+    notes.forEach((note) => piano.noteOn(note, 90, "screen"));
     notes.forEach(registerNote);
-    const timer = window.setTimeout(() => notes.forEach((note) => pianoRef.current?.noteOff(note, "screen")), 420);
+    const timer = window.setTimeout(() => notes.forEach((note) => piano.noteOff(note, "screen")), 420);
     timersRef.current.push(timer);
   }
 
@@ -257,11 +254,9 @@ export default function Home() {
       return;
     }
     stopPlayback();
-    const piano = pianoRef.current;
-    if (!piano || !steps.length) return;
-    const context = piano.ensureAudio();
+    if (!steps.length) return;
+    piano.ensureAudio();
     const secondsPerBeat = 60 / song.bpm;
-    const startAt = context.currentTime + 0.28;
     let cursor = 0;
     setPlaying(true);
     setStepIndex(0);
@@ -276,56 +271,65 @@ export default function Home() {
         const step = demoSteps[index];
         const eventStart = chord.beat * secondsPerBeat;
         const lightTimer = window.setTimeout(
-          () => midiRef.current?.restore(step.notes, demoSteps[index + 1]?.notes || []),
+          () => midi.restore(step.notes, demoSteps[index + 1]?.notes || []),
           eventStart * 1000,
         );
         const screenTimer = window.setTimeout(() => setStepIndex(index), eventStart * 1000 + 200);
         timersRef.current.push(lightTimer, screenTimer);
-        step.notes.forEach((note) => {
-          const source = `demo-${index}`;
-          piano.noteOn(note, 72, source, startAt + eventStart);
-          const offTimer = window.setTimeout(
-            () => piano.noteOff(note, source),
-            (eventStart + Math.min(chord.duration * secondsPerBeat, 1.8)) * 1000 + 280,
-          );
-          timersRef.current.push(offTimer);
-        });
+        const audioTimer = window.setTimeout(() => {
+          step.notes.forEach((note) => {
+            const source = `demo-${index}`;
+            piano.noteOn(note, 72, source);
+            const offTimer = window.setTimeout(
+              () => piano.noteOff(note, source),
+              Math.min(chord.duration * secondsPerBeat, 1.8) * 1000,
+            );
+            timersRef.current.push(offTimer);
+          });
+        }, eventStart * 1000 + 200);
+        timersRef.current.push(audioTimer);
       });
       song.melody.filter((event) => event.beat < finalBeat).forEach((event, index) => {
         const source = `melody-${index}`;
         const eventStart = event.beat * secondsPerBeat;
-        event.notes.forEach((rawNote) => {
-          const note = foldNote(rawNote + shift, rangeFit.target);
-          piano.noteOn(note, 94, source, startAt + eventStart);
-          const offTimer = window.setTimeout(
-            () => piano.noteOff(note, source),
-            (eventStart + Math.max(0.16, event.duration * secondsPerBeat * 0.88)) * 1000 + 280,
-          );
-          timersRef.current.push(offTimer);
-        });
+        const audioTimer = window.setTimeout(() => {
+          event.notes.forEach((rawNote) => {
+            const note = foldNote(rawNote + shift, rangeFit.target);
+            piano.noteOn(note, 94, source);
+            const offTimer = window.setTimeout(
+              () => piano.noteOff(note, source),
+              Math.max(0.16, event.duration * secondsPerBeat * 0.88) * 1000,
+            );
+            timersRef.current.push(offTimer);
+          });
+        }, eventStart * 1000 + 200);
+        timersRef.current.push(audioTimer);
       });
       cursor = finalBeat * secondsPerBeat;
     } else {
       demoSteps.forEach((step, index) => {
-        const lightTimer = window.setTimeout(() => midiRef.current?.restore(step.notes, demoSteps[index + 1]?.notes || []), cursor * 1000);
+        const lightTimer = window.setTimeout(() => midi.restore(step.notes, demoSteps[index + 1]?.notes || []), cursor * 1000);
         const screenTimer = window.setTimeout(() => setStepIndex(index), cursor * 1000 + 200);
         timersRef.current.push(lightTimer, screenTimer);
-        step.notes.forEach((note) => {
-          const source = `demo-${index}`;
-          piano.noteOn(note, 88, source, startAt + cursor);
-          const offTimer = window.setTimeout(
-            () => piano.noteOff(note, source),
-            (cursor + Math.min(step.duration * secondsPerBeat, 1.8)) * 1000 + 280,
-          );
-          timersRef.current.push(offTimer);
-        });
+        const audioTimer = window.setTimeout(() => {
+          step.notes.forEach((note) => {
+            const source = `demo-${index}`;
+            piano.noteOn(note, 88, source);
+            const offTimer = window.setTimeout(
+              () => piano.noteOff(note, source),
+              Math.min(step.duration * secondsPerBeat, 1.8) * 1000,
+            );
+            timersRef.current.push(offTimer);
+          });
+        }, cursor * 1000 + 200);
+        timersRef.current.push(audioTimer);
         cursor += Math.max(0.45, step.duration * secondsPerBeat);
       });
     }
     const endTimer = window.setTimeout(() => {
       setPlaying(false);
       setStepIndex(0);
-      midiRef.current?.restore(steps[0]?.notes || [], steps[1]?.notes || []);
+      midi.restore(steps[0]?.notes || [], steps[1]?.notes || []);
     }, cursor * 1000 + 500);
     timersRef.current.push(endTimer);
   }
@@ -337,6 +341,17 @@ export default function Home() {
     playedRef.current.clear();
     setFeedback(nextLevel === 1 ? "先听完整示范，记住和声走向" : "准备好后，弹出亮起的音");
     if (song.range[0] < rangeFit.target[0] || song.range[1] > rangeFit.target[1]) setShowRangeNotice(true);
+  }
+
+  function chooseMode(nextMode: 36 | 72) {
+    stopPlayback();
+    midi.setMode(nextMode);
+    setMode(nextMode);
+    setStepIndex(0);
+    setHeld(new Set());
+    playedRef.current.clear();
+    const nextFit = fitRange(song.range, nextMode);
+    setShowRangeNotice(song.range[0] < nextFit.target[0] || song.range[1] > nextFit.target[1]);
   }
 
   async function importMusicXml(event: ChangeEvent<HTMLInputElement>) {
@@ -506,7 +521,7 @@ export default function Home() {
             <div><small>音域适配</small><strong>{!rangeFit.fits ? "八度折叠" : shift ? `${shift > 0 ? "+" : ""}${shift}` : "原位"}</strong></div>
           </div>
           {song.warnings.length > 0 && <p className="panel-warning">{song.warnings[0]}</p>}
-          <img src="/partykeys-keyboard.png" alt="音乐密码 36 键键盘" />
+          <Image src="/partykeys-keyboard.png" alt="音乐密码 36 键键盘" width={800} height={800} />
         </aside>
       </section>
 
@@ -514,8 +529,8 @@ export default function Home() {
         <div className="keyboard-head">
           <div><span className="live-dot" /> <strong>演奏区</strong><small>实体琴与屏幕键盘使用同一套判定</small></div>
           <div className="mode-switch" role="group" aria-label="键盘范围">
-            <button className={mode === 36 ? "active" : ""} onClick={() => setMode(36)}>单琴 · 36 键</button>
-            <button className={mode === 72 ? "active" : ""} onClick={() => setMode(72)}>双琴 · 72 键</button>
+            <button className={mode === 36 ? "active" : ""} onClick={() => chooseMode(36)}>单琴 · 36 键</button>
+            <button className={mode === 72 ? "active" : ""} onClick={() => chooseMode(72)}>双琴 · 72 键</button>
           </div>
         </div>
         <div className={`piano keyboard-${mode}`}>
@@ -548,7 +563,7 @@ export default function Home() {
 
       <footer>
         <span>音乐密码 · 一首歌，四步弹会</span>
-        <span>Piano samples: Salamander Grand Piano V3 · Alexander Holm · CC BY 3.0</span>
+        <span>52 samples · 4 velocity layers · spatial reverb · Salamander Grand Piano V3 · CC BY 3.0</span>
       </footer>
     </main>
   );

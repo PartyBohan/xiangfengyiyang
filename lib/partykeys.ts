@@ -9,6 +9,13 @@ export type NormalizedMidiEvent = {
   portId: string;
 };
 
+export type MidiStatus = { inputs: number; partyKeys: number; outputs: number };
+
+export function isMidiBrowserEnvironment() {
+  if (typeof window === "undefined") return false;
+  return Boolean(window.webkit?.messageHandlers?.midiBridge && window.__webMIDIBridge);
+}
+
 const PK_HEADER = [0xf0, 0x05, 0x30, 0x7f, 0x7f, 0x20, 0x00];
 const PK_INIT = [...PK_HEADER, 0x0f, 0x01, 0xf7];
 const PARTYKEYS_MATCH = /partykey/i;
@@ -147,13 +154,13 @@ export class PartyKeysMidi {
   private outputs: MidiOutputLike[] = [];
   private sent = new Map<string, Set<number>>();
   private handler: (event: NormalizedMidiEvent) => void = () => {};
-  private statusHandler: (status: { inputs: number; partyKeys: number; outputs: number }) => void = () => {};
+  private statusHandler: (status: MidiStatus) => void = () => {};
   private sysexEnabled = false;
   mode: 36 | 72 = 36;
 
   async connect(
     handler: (event: NormalizedMidiEvent) => void,
-    statusHandler: (status: { inputs: number; partyKeys: number; outputs: number }) => void,
+    statusHandler: (status: MidiStatus) => void,
   ) {
     this.handler = handler;
     this.statusHandler = statusHandler;
@@ -168,8 +175,8 @@ export class PartyKeysMidi {
       this.access = await request() as unknown as MidiAccessLike;
       this.sysexEnabled = false;
     }
-    this.access!.onstatechange = () => this.bind();
-    this.bind();
+    this.access!.onstatechange = () => { this.bind(); };
+    return this.bind();
   }
 
   setMode(mode: 36 | 72) {
@@ -177,8 +184,8 @@ export class PartyKeysMidi {
     this.restore([]);
   }
 
-  private bind() {
-    if (!this.access) return;
+  private bind(): MidiStatus {
+    if (!this.access) return { inputs: 0, partyKeys: 0, outputs: 0 };
     this.inputs = [...this.access.inputs.values()].filter((port) => port.state !== "disconnected");
     this.outputs = [...this.access.outputs.values()]
       .filter((port) => this.sysexEnabled && port.state !== "disconnected" && PARTYKEYS_MATCH.test(port.name || ""))
@@ -206,11 +213,13 @@ export class PartyKeysMidi {
       }
       this.sent.set(output.id, new Set());
     }
-    this.statusHandler({
+    const status = {
       inputs: this.inputs.length,
       partyKeys: this.inputs.filter((port) => PARTYKEYS_MATCH.test(port.name || "")).length,
       outputs: this.outputs.length,
-    });
+    };
+    this.statusHandler(status);
+    return status;
   }
 
   private normalizeNote(input: MidiInputLike, rawNote: number) {
@@ -256,8 +265,8 @@ export class PartyKeysMidi {
   }
 }
 
-const SAMPLE_PITCHES = [48, 51, 54, 57, 60, 63, 66, 69, 72, 75, 78, 81, 84];
-const SAMPLE_LAYERS = [
+export const SAMPLE_PITCHES = [48, 51, 54, 57, 60, 63, 66, 69, 72, 75, 78, 81, 84];
+export const SAMPLE_LAYERS = [
   { suffix: 4, maxVelocity: 45 },
   { suffix: 8, maxVelocity: 78 },
   { suffix: 12, maxVelocity: 106 },
@@ -269,18 +278,48 @@ function sampleName(midi: number) {
   return `${names[midi % 12]}${Math.floor(midi / 12) - 1}`;
 }
 
+export function layerForVelocity(velocity: number) {
+  const value = Math.max(1, Math.min(127, Math.round(velocity || 1)));
+  let index = SAMPLE_LAYERS.findIndex((layer) => value <= layer.maxVelocity);
+  if (index < 0) index = SAMPLE_LAYERS.length - 1;
+  return { index, value };
+}
+
+export function nearestSampleIndex(note: number) {
+  let bestIndex = 0;
+  let bestDistance = Infinity;
+  SAMPLE_PITCHES.forEach((pitch, index) => {
+    const distance = Math.abs(note - pitch);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  });
+  return bestIndex;
+}
+
 type Voice = { node: AudioScheduledSourceNode; gain: GainNode; source: string };
 
 export class FourLayerPiano {
   context: AudioContext | null = null;
+  private readonly baseURL: string;
+  private readonly maxVoices: number;
+  private volume: number;
   private buffers: AudioBuffer[][] | null = null;
   private loading: Promise<void> | null = null;
   private ready = false;
   private keysBus: GainNode | null = null;
   private master: GainNode | null = null;
+  private fallbackWave: PeriodicWave | null = null;
   private active = new Map<string, Voice>();
   private deferred = new Set<string>();
   private sustain = false;
+
+  constructor({ baseURL = "/samples/", maxVoices = 48, volume = 0.8 } = {}) {
+    this.baseURL = baseURL.endsWith("/") ? baseURL : `${baseURL}/`;
+    this.maxVoices = maxVoices;
+    this.volume = volume;
+  }
 
   ensureAudio() {
     if (!this.context) this.createGraph();
@@ -294,7 +333,7 @@ export class FourLayerPiano {
     const context = new AudioContextClass();
     this.context = context;
     this.master = context.createGain();
-    this.master.gain.value = 0.8;
+    this.master.gain.value = this.volume;
     const compressor = context.createDynamicsCompressor();
     compressor.threshold.value = -14;
     compressor.ratio.value = 3;
@@ -303,6 +342,34 @@ export class FourLayerPiano {
     this.keysBus.connect(this.master);
     this.master.connect(compressor);
     compressor.connect(context.destination);
+
+    const impulseResponse = this.makeImpulseResponse(1.9, 2.6);
+    const convolver = context.createConvolver();
+    const pianoWet = context.createGain();
+    convolver.buffer = impulseResponse;
+    pianoWet.gain.value = 0.16;
+    this.keysBus.connect(convolver);
+    convolver.connect(pianoWet);
+    pianoWet.connect(this.master);
+
+    const harmonics = [0, 1, 0.55, 0.28, 0.14, 0.07];
+    const real = new Float32Array(harmonics.length);
+    const imag = new Float32Array(harmonics.length);
+    harmonics.forEach((value, index) => { imag[index] = value; });
+    this.fallbackWave = context.createPeriodicWave(real, imag);
+  }
+
+  private makeImpulseResponse(seconds: number, decay: number) {
+    const context = this.context!;
+    const length = Math.floor(context.sampleRate * seconds);
+    const buffer = context.createBuffer(2, length, context.sampleRate);
+    for (let channel = 0; channel < 2; channel += 1) {
+      const data = buffer.getChannelData(channel);
+      for (let index = 0; index < length; index += 1) {
+        data[index] = (Math.random() * 2 - 1) * ((1 - index / length) ** decay);
+      }
+    }
+    return buffer;
   }
 
   private async loadSamples() {
@@ -310,7 +377,7 @@ export class FourLayerPiano {
     try {
       const decoded = await Promise.all(SAMPLE_LAYERS.flatMap((layer, layerIndex) =>
         SAMPLE_PITCHES.map(async (pitch, pitchIndex) => {
-          const response = await fetch(`/samples/${sampleName(pitch)}v${layer.suffix}.mp3`);
+          const response = await fetch(`${this.baseURL}${sampleName(pitch)}v${layer.suffix}.mp3`);
           if (!response.ok) throw new Error("sample unavailable");
           const buffer = await context.decodeAudioData(await response.arrayBuffer());
           return { layerIndex, pitchIndex, buffer };
@@ -321,8 +388,22 @@ export class FourLayerPiano {
         this.buffers![layerIndex][pitchIndex] = buffer;
       });
       this.ready = true;
-    } catch {
+    } catch (error) {
+      console.warn("Hi-fi piano unavailable; synthesized fallback remains active.", error);
       this.ready = false;
+    }
+  }
+
+  setVolume(value: number) {
+    this.volume = Math.max(0, Math.min(1, Number(value) || 0));
+    if (this.master) this.master.gain.value = this.volume;
+  }
+
+  private enforceVoiceLimit() {
+    while (this.active.size >= this.maxVoices) {
+      const oldest = this.active.keys().next().value;
+      if (oldest == null) break;
+      this.releaseKey(oldest, 0.04, true);
     }
   }
 
@@ -330,28 +411,26 @@ export class FourLayerPiano {
     const context = this.ensureAudio();
     const key = `${source}:${note}`;
     this.releaseKey(key, 0.04, true);
+    this.enforceVoiceLimit();
     const start = Math.max(context.currentTime, when ?? context.currentTime);
     const gain = context.createGain();
     let node: AudioScheduledSourceNode;
     if (this.ready && this.buffers) {
-      const layerIndex = Math.max(0, SAMPLE_LAYERS.findIndex((layer) => velocity <= layer.maxVelocity));
-      let pitchIndex = 0;
-      SAMPLE_PITCHES.forEach((pitch, index) => {
-        if (Math.abs(note - pitch) < Math.abs(note - SAMPLE_PITCHES[pitchIndex])) pitchIndex = index;
-      });
+      const velocityLayer = layerForVelocity(velocity);
+      const pitchIndex = nearestSampleIndex(note);
       const sourceNode = context.createBufferSource();
-      sourceNode.buffer = this.buffers[layerIndex][pitchIndex];
+      sourceNode.buffer = this.buffers[velocityLayer.index][pitchIndex];
       sourceNode.playbackRate.value = 2 ** ((note - SAMPLE_PITCHES[pitchIndex]) / 12);
-      gain.gain.value = 0.32 + 0.55 * (velocity / 127);
+      gain.gain.value = 0.32 + 0.55 * (velocityLayer.value / 127);
       node = sourceNode;
     } else {
       const oscillator = context.createOscillator();
-      oscillator.type = "triangle";
+      if (this.fallbackWave) oscillator.setPeriodicWave(this.fallbackWave);
       oscillator.frequency.value = 440 * (2 ** ((note - 69) / 12));
-      const level = Math.max(0.02, velocity / 127 * 0.28);
+      const level = Math.max(0.01, Math.min(127, Math.max(1, velocity)) / 127 * 0.32);
       gain.gain.setValueAtTime(0.0001, start);
       gain.gain.exponentialRampToValueAtTime(level, start + 0.008);
-      gain.gain.exponentialRampToValueAtTime(Math.max(level * 0.25, 0.001), start + 1.2);
+      gain.gain.exponentialRampToValueAtTime(Math.max(level * 0.3, 0.001), start + 1.4);
       node = oscillator;
     }
     node.connect(gain);
@@ -382,6 +461,7 @@ export class FourLayerPiano {
     if (!voice || !this.context) return;
     if (this.sustain && !force && voice.source === "user") return;
     this.active.delete(key);
+    this.deferred.delete(key);
     const now = this.context.currentTime;
     voice.gain.gain.cancelScheduledValues(now);
     voice.gain.gain.setValueAtTime(Math.max(voice.gain.gain.value, 0.0005), now);
@@ -399,5 +479,7 @@ export class FourLayerPiano {
 declare global {
   interface Window {
     webkitAudioContext: typeof AudioContext;
+    webkit?: { messageHandlers?: { midiBridge?: unknown } };
+    __webMIDIBridge?: unknown;
   }
 }
