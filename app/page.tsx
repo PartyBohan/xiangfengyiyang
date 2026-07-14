@@ -2,7 +2,7 @@
 
 import { ChangeEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
-import { DEMO_SONG, SongArrangement, fitRange, midiName, parseMusicXml } from "../lib/music";
+import { DEMO_SONG, SongArrangement, fitRange, midiName, parseMusicXml, rootPositionVoicing } from "../lib/music";
 import { FourLayerPiano, isMidiBrowserEnvironment, NormalizedMidiEvent, PartyKeysMidi } from "../lib/partykeys";
 
 type PracticeStep = {
@@ -34,12 +34,15 @@ function foldNote(note: number, target: [number, number]) {
 }
 
 function makeSteps(song: SongArrangement, level: number, shift: number, target: [number, number]): PracticeStep[] {
-  const move = (notes: number[]) => [...new Set(notes.map((note) => foldNote(note + shift, target)))].sort((a, b) => a - b);
+  const moveNotes = (notes: number[]) => [...new Set(notes.map((note) => foldNote(note + shift, target)))].sort((a, b) => a - b);
+  const moveChord = (notes: number[], preferredRoot: number) =>
+    rootPositionVoicing(notes.map((note) => note + shift), target, preferredRoot);
+  const leftRootCenter = target[0] <= 36 ? 45 : 54;
   if (level === 1) {
     return song.chords.slice(0, 8).map((chord) => ({
       label: chord.symbol,
-      sublabel: "示范段落",
-      notes: move(chord.notes),
+      sublabel: "原位和弦 · 示范段落",
+      notes: moveChord(chord.notes, 54),
       duration: chord.duration,
       lyric: chord.lyric,
     }));
@@ -47,33 +50,37 @@ function makeSteps(song: SongArrangement, level: number, shift: number, target: 
   if (level === 2) {
     return song.chords.slice(0, 16).map((chord, index) => ({
       label: chord.symbol,
-      sublabel: `第 ${index + 1} 小节 · ${Math.round(chord.duration)} 拍`,
-      notes: move(chord.notes),
+      sublabel: `原位和弦 · 第 ${index + 1} 组 · ${Math.round(chord.duration)} 拍`,
+      notes: moveChord(chord.notes, 54),
       duration: chord.duration,
       lyric: chord.lyric || song.lyrics[index] || `第 ${index + 1} 句 · 等待歌词`,
     }));
   }
   if (level === 3) {
     return song.chords.slice(0, 8).flatMap((chord) => {
-      const notes = move(chord.notes);
-      const root = foldNote(notes[0] > 59 ? notes[0] - 12 : notes[0], target);
-      const fifth = foldNote(root + 7, target);
-      const upper = notes.map((note) => foldNote(note < 60 ? note + 12 : note, target));
+      const leftChord = moveChord(chord.notes, leftRootCenter);
+      const root = leftChord[0];
+      const fifth = root + 7;
+      const upper = moveChord(chord.notes, 66);
       return [
         { label: chord.symbol, sublabel: "左手 · 根音", notes: [root], duration: 1, lyric: chord.lyric },
-        { label: chord.symbol, sublabel: "右手 · 和弦", notes: upper, duration: 1, lyric: chord.lyric },
+        { label: chord.symbol, sublabel: "右手 · 原位和弦", notes: upper, duration: 1, lyric: chord.lyric },
         { label: chord.symbol, sublabel: "左手 · 五音", notes: [fifth], duration: 1, lyric: chord.lyric },
-        { label: chord.symbol, sublabel: "右手 · 和弦", notes: upper, duration: 1, lyric: chord.lyric },
+        { label: chord.symbol, sublabel: "右手 · 原位和弦", notes: upper, duration: 1, lyric: chord.lyric },
       ];
     });
   }
+  let previousChordBeat = -Infinity;
   return song.melody.slice(0, 32).map((melody) => {
     const chord = activeChord(song, melody.beat);
-    const bass = chord.notes[0] > 55 ? chord.notes[0] - 12 : chord.notes[0];
+    const chordChanged = chord.beat !== previousChordBeat;
+    previousChordBeat = chord.beat;
+    const leftChord = chordChanged ? moveChord(chord.notes, leftRootCenter) : [];
+    const melodyNotes = moveNotes(melody.notes);
     return {
       label: chord.symbol,
-      sublabel: "左手低音 ＋ 右手旋律",
-      notes: move([bass, ...melody.notes]),
+      sublabel: chordChanged ? "左手原位和弦 ＋ 右手旋律" : "右手旋律 · 左手保持",
+      notes: [...new Set([...leftChord, ...melodyNotes])].sort((a, b) => a - b),
       duration: melody.duration,
       lyric: melody.lyric,
     };

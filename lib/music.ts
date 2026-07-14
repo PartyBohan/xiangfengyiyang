@@ -363,6 +363,36 @@ export function midiName(note: number) {
   return `${names[((note % 12) + 12) % 12]}${Math.floor(note / 12) - 1}`;
 }
 
+export function rootPositionVoicing(
+  notes: number[],
+  target: [number, number],
+  preferredRoot: number,
+) {
+  if (!notes.length) return [];
+  const sourceRoot = notes[0];
+  const rootClass = ((sourceRoot % 12) + 12) % 12;
+  const intervals = [...new Set(notes.map((note) => ((note - sourceRoot) % 12 + 12) % 12))]
+    .sort((a, b) => a - b);
+  if (!intervals.includes(0)) intervals.unshift(0);
+  const highestInterval = intervals.at(-1) || 0;
+  const candidates: number[] = [];
+  for (let root = target[0]; root + highestInterval <= target[1]; root += 1) {
+    if (((root % 12) + 12) % 12 === rootClass) candidates.push(root);
+  }
+  const chosenRoot = candidates.sort((a, b) =>
+    Math.abs(a - preferredRoot) - Math.abs(b - preferredRoot) || a - b,
+  )[0];
+  if (chosenRoot == null) return notes.map((note) => foldIntoRange(note, target));
+  return intervals.map((interval) => chosenRoot + interval);
+}
+
+function foldIntoRange(note: number, target: [number, number]) {
+  let value = note;
+  while (value < target[0]) value += 12;
+  while (value > target[1]) value -= 12;
+  return value;
+}
+
 export function fitRange(range: [number, number], mode: 36 | 72) {
   const target: [number, number] = mode === 36 ? [48, 83] : [36, 107];
   let shift = 0;

@@ -7,6 +7,7 @@ import {
   nearestSampleIndex,
   parseMidiPacket,
 } from "../lib/partykeys.ts";
+import { rootPositionVoicing } from "../lib/music.ts";
 
 test("preserves packets, running status, velocity and CC64", () => {
   const events = [];
@@ -44,4 +45,13 @@ test("keeps RGB SysEx frames inside the MidiBrowser limit", () => {
   const frames = buildRgbFrames(groups);
   assert(frames.length > 1);
   assert(frames.every((frame) => frame.length <= 256));
+});
+
+test("keeps every teaching chord in root position when changing register", () => {
+  const target = [48, 83];
+  assert.deepEqual(rootPositionVoicing([48, 52, 55], target, 54), [48, 52, 55]);
+  assert.deepEqual(rootPositionVoicing([57, 60, 64], target, 66), [69, 72, 76]);
+  assert.deepEqual(rootPositionVoicing([53, 57, 60], target, 66), [65, 69, 72]);
+  assert.deepEqual(rootPositionVoicing([55, 59, 62], target, 66), [67, 71, 74]);
+  assert.deepEqual(rootPositionVoicing([50, 53, 57], target, 54), [50, 53, 57]);
 });
